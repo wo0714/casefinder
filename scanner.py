@@ -1,9 +1,10 @@
 """
 CaseFinder - Exocad Project Folder Scanner
+- Reads watch paths from SQLite DB (managed via web UI)
 - Scans designated folders for Exocad project directories
 - Uses Gemini to intelligently parse clinic, doctor, and patient names
-- Stores results in SQLite database
-- Watches for new/changed folders and updates DB automatically
+- Watches for new/changed/deleted folders and updates DB automatically
+- Flags duplicate folder names across different paths
 
 Requirements:
     pip install google-genai watchdog python-dotenv
@@ -32,26 +33,26 @@ load_dotenv()
 
 
 # ─────────────────────────────────────────────
-#  CONFIGURATION  — edit these before running
+#  CONFIGURATION
 # ─────────────────────────────────────────────
 
-# Paths to scan. Use raw strings (r"...") for Windows UNC paths.
-WATCH_PATHS = [
-    r"/Volumes/YCLab_ALL/Data/CAD-Data/DO NOT delet MSI CAD-Data/2024/2024-05",
-    # Add more paths here as needed:
+# Bootstrap path — used only on very first run before any paths are added via UI.
+# After first run, paths are managed in the database via the web UI.
+BOOTSTRAP_PATHS = [
+    r"/Users/wayne/dev/projects/yclab/casefinder/exocad",
     # r"\\DXP6800PRO-86DD\YCLab_ALL\Data\CAD-Data\DO NOT delet CAD-Data",
 ]
 
 DB_PATH = "exocad_projects.db"
-
 GEMINI_MODEL = "gemini-2.5-flash"
-
-# Minimum seconds between re-scans triggered by watchdog events
 RESCAN_DEBOUNCE_SECONDS = 5
+
+# How often (seconds) the scanner polls the DB for newly added watch paths
+POLL_INTERVAL_SECONDS = 30
 
 
 # ─────────────────────────────────────────────
-#  LOGGING SETUP
+#  LOGGING
 # ─────────────────────────────────────────────
 
 logging.basicConfig(
@@ -84,27 +85,96 @@ def get_connection() -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection):
     conn.executescript("""
+        CREATE TABLE IF NOT EXISTS watch_paths (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            path         TEXT    NOT NULL UNIQUE,
+            label        TEXT,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            added_at     TEXT    NOT NULL,
+            last_scanned TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS projects (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            folder_name   TEXT    NOT NULL UNIQUE,
-            folder_path   TEXT    NOT NULL,
+            folder_name   TEXT    NOT NULL,
+            folder_path   TEXT    NOT NULL UNIQUE,
             project_date  TEXT,
             clinic        TEXT,
             doctor        TEXT,
             patient       TEXT,
             raw_parse     TEXT,
             parse_method  TEXT,
+            is_duplicate  INTEGER NOT NULL DEFAULT 0,
             first_seen    TEXT    NOT NULL,
             last_seen     TEXT    NOT NULL
         );
 
-        CREATE INDEX IF NOT EXISTS idx_clinic  ON projects(clinic);
-        CREATE INDEX IF NOT EXISTS idx_doctor  ON projects(doctor);
-        CREATE INDEX IF NOT EXISTS idx_patient ON projects(patient);
-        CREATE INDEX IF NOT EXISTS idx_date    ON projects(project_date);
+        CREATE INDEX IF NOT EXISTS idx_clinic      ON projects(clinic);
+        CREATE INDEX IF NOT EXISTS idx_doctor      ON projects(doctor);
+        CREATE INDEX IF NOT EXISTS idx_patient     ON projects(patient);
+        CREATE INDEX IF NOT EXISTS idx_date        ON projects(project_date);
+        CREATE INDEX IF NOT EXISTS idx_folder_name ON projects(folder_name);
+        CREATE INDEX IF NOT EXISTS idx_duplicate   ON projects(is_duplicate);
     """)
     conn.commit()
     log.info("Database ready: %s", DB_PATH)
+
+
+def bootstrap_watch_paths(conn: sqlite3.Connection):
+    """Insert bootstrap paths into watch_paths table if no paths exist yet."""
+    count = conn.execute("SELECT COUNT(*) FROM watch_paths").fetchone()[0]
+    if count == 0:
+        now = datetime.now().isoformat(timespec="seconds")
+        for path in BOOTSTRAP_PATHS:
+            try:
+                conn.execute(
+                    "INSERT INTO watch_paths (path, label, enabled, added_at) VALUES (?, ?, 1, ?)",
+                    (path, Path(path).name, now)
+                )
+                log.info("Bootstrap watch path added: %s", path)
+            except sqlite3.IntegrityError:
+                pass
+        conn.commit()
+
+
+def get_enabled_paths(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id, path, label FROM watch_paths WHERE enabled = 1"
+    ).fetchall()
+    return [{"id": r["id"], "path": r["path"], "label": r["label"]} for r in rows]
+
+
+def update_last_scanned(conn: sqlite3.Connection, path_id: int):
+    conn.execute(
+        "UPDATE watch_paths SET last_scanned = ? WHERE id = ?",
+        (datetime.now().isoformat(timespec="seconds"), path_id)
+    )
+    conn.commit()
+
+
+# ─────────────────────────────────────────────
+#  DUPLICATE DETECTION
+# ─────────────────────────────────────────────
+
+def check_and_flag_duplicates(conn: sqlite3.Connection, folder_name: str):
+    """If multiple rows share the same folder_name, flag all as duplicates."""
+    rows = conn.execute(
+        "SELECT id FROM projects WHERE folder_name = ?", (folder_name,)
+    ).fetchall()
+    if len(rows) > 1:
+        ids = [r["id"] for r in rows]
+        conn.execute(
+            f"UPDATE projects SET is_duplicate = 1 WHERE id IN ({','.join('?' * len(ids))})",
+            ids
+        )
+        conn.commit()
+        log.info("Duplicate flagged: %s (%d copies)", folder_name, len(rows))
+    else:
+        # Clear duplicate flag if only one remains
+        conn.execute(
+            "UPDATE projects SET is_duplicate = 0 WHERE folder_name = ?", (folder_name,)
+        )
+        conn.commit()
 
 
 # ─────────────────────────────────────────────
@@ -127,34 +197,24 @@ Example output: {"date":"2025-01-03","clinic":"Sherwood Dental","doctor":"Barkwe
 
 
 def parse_with_gemini(folder_name: str) -> dict:
-    """Call Gemini to extract structured fields from a folder name."""
     clean_name = re.sub(r"\s*-\s*copy\s*$", "", folder_name, flags=re.IGNORECASE).strip()
-
-    # Append folder name separately to avoid .format() clashing with JSON braces
     prompt = GEMINI_PROMPT + "\n\nFolder name: " + clean_name
-
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         text = response.text.strip()
-        # Strip markdown fences if Gemini adds them anyway
         text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\n?```$", "", text)
         parsed = json.loads(text)
         log.debug("Gemini parsed '%s' -> %s", folder_name, parsed)
         return parsed
     except json.JSONDecodeError as e:
-        log.warning("Gemini JSON parse error for '%s': %s | raw: %s", folder_name, e, text)
+        log.warning("Gemini JSON parse error for '%s': %s", folder_name, e)
     except Exception as e:
         log.warning("Gemini API error for '%s': %s", folder_name, e)
-
     return {"date": None, "clinic": None, "doctor": None, "patient": None}
 
 
 def parse_date_from_name(folder_name: str) -> str | None:
-    """Local fallback: extract date from folder name prefix."""
     m = re.match(r"(\d{4}-\d{2}-\d{2})", folder_name)
     return m.group(1) if m else None
 
@@ -171,58 +231,45 @@ def looks_like_project_folder(name: str) -> bool:
 
 
 def upsert_project(conn: sqlite3.Connection, folder_name: str, folder_path: str):
-    """Parse and insert/update a single project folder in the database."""
+    """Insert or update a project. Unique on folder_path; flags duplicates by folder_name."""
     now = datetime.now().isoformat(timespec="seconds")
 
     existing = conn.execute(
-        "SELECT id FROM projects WHERE folder_name = ?", (folder_name,)
+        "SELECT id FROM projects WHERE folder_path = ?", (folder_path,)
     ).fetchone()
 
     if existing:
-        # Already indexed — just refresh timestamps and path
         conn.execute(
-            "UPDATE projects SET last_seen = ?, folder_path = ? WHERE folder_name = ?",
-            (now, folder_path, folder_name),
+            "UPDATE projects SET last_seen = ? WHERE folder_path = ?",
+            (now, folder_path),
         )
         conn.commit()
         return
 
-    # New folder — parse with Gemini
+    # New entry — parse with Gemini
     parsed = parse_with_gemini(folder_name)
-
-    # Local fallback for date if Gemini missed it
     project_date = parsed.get("date") or parse_date_from_name(folder_name)
 
     conn.execute(
         """
         INSERT INTO projects
             (folder_name, folder_path, project_date, clinic, doctor, patient,
-             raw_parse, parse_method, first_seen, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(folder_name) DO UPDATE SET
-            folder_path   = excluded.folder_path,
-            project_date  = excluded.project_date,
-            clinic        = excluded.clinic,
-            doctor        = excluded.doctor,
-            patient       = excluded.patient,
-            raw_parse     = excluded.raw_parse,
-            parse_method  = excluded.parse_method,
-            last_seen     = excluded.last_seen
+             raw_parse, parse_method, is_duplicate, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        ON CONFLICT(folder_path) DO UPDATE SET
+            last_seen = excluded.last_seen
         """,
         (
-            folder_name,
-            folder_path,
-            project_date,
-            parsed.get("clinic"),
-            parsed.get("doctor"),
-            parsed.get("patient"),
-            json.dumps(parsed),
-            "gemini",
-            now,
-            now,
+            folder_name, folder_path, project_date,
+            parsed.get("clinic"), parsed.get("doctor"), parsed.get("patient"),
+            json.dumps(parsed), "gemini", now, now,
         ),
     )
     conn.commit()
+
+    # Check for duplicates after insert
+    check_and_flag_duplicates(conn, folder_name)
+
     log.info(
         "Indexed: %s | %s | Dr. %s | %s",
         project_date,
@@ -232,8 +279,30 @@ def upsert_project(conn: sqlite3.Connection, folder_name: str, folder_path: str)
     )
 
 
-def scan_path(conn: sqlite3.Connection, base_path: str):
-    """Recursively scan base_path for Exocad project folders at any depth."""
+def delete_project_by_path(conn: sqlite3.Connection, folder_path: str):
+    folder_name_result = conn.execute(
+        "SELECT folder_name FROM projects WHERE folder_path = ? OR folder_path LIKE ?",
+        (folder_path, folder_path + "%")
+    ).fetchone()
+
+    result = conn.execute(
+        "DELETE FROM projects WHERE folder_path = ? OR folder_path LIKE ?",
+        (folder_path, folder_path + "%")
+    )
+    conn.commit()
+
+    if result.rowcount > 0:
+        log.info("Removed from DB: %s", folder_path)
+        # Re-check duplicate status for remaining entries with same folder_name
+        if folder_name_result:
+            check_and_flag_duplicates(conn, folder_name_result["folder_name"])
+
+
+def scan_path(conn: sqlite3.Connection, path_info: dict):
+    """Recursively scan a watch path for Exocad project folders."""
+    base_path = path_info["path"]
+    path_id = path_info["id"]
+
     log.info("Scanning: %s", base_path)
     base = Path(base_path)
 
@@ -247,21 +316,20 @@ def scan_path(conn: sqlite3.Connection, base_path: str):
             upsert_project(conn, entry.name, str(entry))
             count += 1
 
+    update_last_scanned(conn, path_id)
     log.info("Scan complete: %d project folders found in %s", count, base_path)
 
 
 def full_scan(conn: sqlite3.Connection):
-    """Scan all configured watch paths."""
-    for path in WATCH_PATHS:
-        scan_path(conn, path)
+    for path_info in get_enabled_paths(conn):
+        scan_path(conn, path_info)
 
 
 # ─────────────────────────────────────────────
-#  WATCHDOG — live folder monitoring
+#  WATCHDOG
 # ─────────────────────────────────────────────
 
 class ProjectFolderHandler(FileSystemEventHandler):
-    """Watches for new/moved directories and triggers rescans."""
 
     def __init__(self, conn: sqlite3.Connection):
         super().__init__()
@@ -287,42 +355,87 @@ class ProjectFolderHandler(FileSystemEventHandler):
                 log.info("New project folder detected: %s", name)
                 upsert_project(self.conn, name, event.src_path)
             else:
-                # Could be a new month folder — do a broader rescan
                 self._schedule_rescan()
+
+    def on_deleted(self, event):
+        log.info("Delete event — is_dir: %s | path: %s", event.is_directory, event.src_path)
+        delete_project_by_path(self.conn, event.src_path)
 
     def on_moved(self, event):
         if event.is_directory:
             old_name = Path(event.src_path).name
             new_name = Path(event.dest_path).name
-            # Remove old entry
-            self.conn.execute("DELETE FROM projects WHERE folder_name = ?", (old_name,))
-            self.conn.commit()
-            log.info("Removed renamed folder: %s", old_name)
-            # Index the new name if it looks like a project
+            log.info("Folder renamed: %s -> %s", old_name, new_name)
+            delete_project_by_path(self.conn, event.src_path)
             if looks_like_project_folder(new_name):
                 upsert_project(self.conn, new_name, event.dest_path)
-            
-    def on_deleted(self, event):
-        if event.is_directory:
-            name = Path(event.src_path).name
-            if looks_like_project_folder(name):
-                conn = self.conn
-                conn.execute("DELETE FROM projects WHERE folder_name = ?", (name,))
-                conn.commit()
-                log.info("Removed from DB: %s", name)
 
 
-def start_watcher(conn: sqlite3.Connection) -> Observer:
-    observer = Observer()
-    handler = ProjectFolderHandler(conn)
-    for path in WATCH_PATHS:
-        if Path(path).exists():
-            observer.schedule(handler, path, recursive=True)
-            log.info("Watching: %s", path)
-        else:
-            log.warning("Cannot watch (path unavailable): %s", path)
-    observer.start()
-    return observer
+# ─────────────────────────────────────────────
+#  PATH WATCHER MANAGER
+#  Polls DB for newly added/removed watch paths
+#  and updates watchdog observers accordingly
+# ─────────────────────────────────────────────
+
+class PathWatcherManager:
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+        self.observer = Observer()
+        self.handler = ProjectFolderHandler(conn)
+        self.watched: dict[str, object] = {}  # path -> watchdog watch handle
+        self._running = False
+
+    def start(self):
+        self.observer.start()
+        self._sync_watches()
+        self._running = True
+        thread = threading.Thread(target=self._poll_loop, daemon=True)
+        thread.start()
+
+    def stop(self):
+        self._running = False
+        self.observer.stop()
+        self.observer.join()
+
+    def _sync_watches(self):
+        """Add/remove watchdog watches to match enabled DB paths."""
+        enabled = {p["path"] for p in get_enabled_paths(self.conn)}
+
+        # Add new paths
+        for path in enabled:
+            if path not in self.watched:
+                if Path(path).exists():
+                    watch = self.observer.schedule(self.handler, path, recursive=True)
+                    self.watched[path] = watch
+                    log.info("Now watching: %s", path)
+                else:
+                    log.warning("Cannot watch (path unavailable): %s", path)
+
+        # Remove paths no longer enabled
+        for path in list(self.watched.keys()):
+            if path not in enabled:
+                self.observer.unschedule(self.watched.pop(path))
+                log.info("Stopped watching: %s", path)
+
+    def _poll_loop(self):
+        """Periodically check DB for new/removed paths and rescan."""
+        while self._running:
+            time.sleep(POLL_INTERVAL_SECONDS)
+            try:
+                self._sync_watches()
+                # Scan any paths not yet scanned
+                for path_info in get_enabled_paths(self.conn):
+                    row = self.conn.execute(
+                        "SELECT last_scanned FROM watch_paths WHERE id = ?",
+                        (path_info["id"],)
+                    ).fetchone()
+                    if not row["last_scanned"]:
+                        log.info("New path detected, scanning: %s", path_info["path"])
+                        scan_path(self.conn, path_info)
+                        self._sync_watches()
+            except Exception as e:
+                log.error("Poll loop error: %s", e)
 
 
 # ─────────────────────────────────────────────
@@ -334,9 +447,11 @@ def main():
 
     conn = get_connection()
     init_db(conn)
+    bootstrap_watch_paths(conn)
     full_scan(conn)
 
-    observer = start_watcher(conn)
+    manager = PathWatcherManager(conn)
+    manager.start()
 
     log.info("Scanner running. Press Ctrl+C to stop.")
     try:
@@ -345,8 +460,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Stopping...")
     finally:
-        observer.stop()
-        observer.join()
+        manager.stop()
         conn.close()
         log.info("Scanner stopped.")
 
