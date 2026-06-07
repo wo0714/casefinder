@@ -3,21 +3,103 @@ CaseFinder - Web UI
 Serves search interface and settings for the Exocad project database.
 
 Requirements:
-    pip install flask
+    pip install flask google-genai python-dotenv
 
 Usage:
     python app.py
     Open http://localhost:5000
 """
 
+import os
+import re
+import json
 import sqlite3
 from pathlib import Path
-from flask import Flask, request, jsonify, render_template_string
 from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string
+from dotenv import load_dotenv
+from google import genai
+
+load_dotenv()
 
 app = Flask(__name__)
 DB_PATH = "exocad_projects.db"
 
+# ─────────────────────────────────────────────
+#  GEMINI CLIENT
+# ─────────────────────────────────────────────
+
+gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+GEMINI_MODEL = "gemini-2.5-flash"
+
+SEARCH_PARSE_PROMPT = """You are a search query parser for a dental lab case management system.
+Extract search intent from the user's query and return ONLY a valid JSON object.
+
+Fields to extract:
+- clinic: clinic name or partial name (string or null)
+- doctor: doctor name or partial name (string or null)
+- patient: patient name or partial name (string or null)
+- date_from: start date as YYYY-MM-DD (string or null). Interpret relative terms using today's date.
+- date_to: end date as YYYY-MM-DD (string or null). If only a month/year is given with no range, set date_from to first day and date_to to last day of that month.
+
+Rules:
+- Be flexible with spelling and partial names (e.g. "trusmiles" = "TruSmiles")
+- Interpret date ranges like "between mar and may 2024", "last 3 months", "jan 2025", "2024"
+- If only a year is given (e.g. "2024"), set date_from=2024-01-01 and date_to=2024-12-31
+- If no date info is present, return null for both date fields
+- Today's date is: {today}
+
+Respond ONLY with valid JSON, no markdown, no explanation.
+
+Examples:
+Input: trusmiles 2024 may
+Output: {{"clinic":"trusmiles","doctor":null,"patient":null,"date_from":"2024-05-01","date_to":"2024-05-31"}}
+
+Input: trusmiles 2024 between mar and may
+Output: {{"clinic":"trusmiles","doctor":null,"patient":null,"date_from":"2024-03-01","date_to":"2024-05-31"}}
+
+Input: john smith sherwood
+Output: {{"clinic":"sherwood","doctor":null,"patient":"john smith","date_from":null,"date_to":null}}
+
+Input: dr barkwell last 6 months
+Output: {{"clinic":null,"doctor":"barkwell","patient":null,"date_from":"{six_months_ago}","date_to":"{today}"}}
+
+Query: """
+
+
+def parse_search_query(query: str) -> dict | None:
+    """Use Gemini to parse a natural language search query into structured filters."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    # Compute 6-months-ago for the prompt example
+    from datetime import timedelta
+    six_months_ago = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+
+    prompt = SEARCH_PARSE_PROMPT.format(
+        today=today,
+        six_months_ago=six_months_ago,
+        today2=today
+    ) + query
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        text = response.text.strip()
+        text = re.sub(r"^```[a-z]*\n?", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n?```$", "", text)
+        parsed = json.loads(text)
+        # Return None if everything is null (Gemini couldn't parse anything useful)
+        if all(v is None for v in parsed.values()):
+            return None
+        return parsed
+    except Exception as e:
+        return None
+
+
+# ─────────────────────────────────────────────
+#  DATABASE
+# ─────────────────────────────────────────────
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -27,15 +109,102 @@ def get_db():
 
 def row_to_dict(row):
     return {
-        "id": row["id"],
-        "folder_name": row["folder_name"],
-        "folder_path": row["folder_path"],
+        "id":           row["id"],
+        "folder_name":  row["folder_name"],
+        "folder_path":  row["folder_path"],
         "project_date": row["project_date"],
-        "clinic": row["clinic"],
-        "doctor": row["doctor"],
-        "patient": row["patient"],
+        "clinic":       row["clinic"],
+        "doctor":       row["doctor"],
+        "patient":      row["patient"],
         "is_duplicate": bool(row["is_duplicate"]),
     }
+
+
+# ─────────────────────────────────────────────
+#  SEARCH LOGIC
+# ─────────────────────────────────────────────
+
+def ai_search(conn, filters: dict) -> tuple[list, list, list]:
+    """Run structured SQL search based on AI-extracted filters."""
+    conditions = []
+    params = []
+
+    if filters.get("clinic"):
+        conditions.append("clinic LIKE ?")
+        params.append(f"%{filters['clinic']}%")
+    if filters.get("doctor"):
+        conditions.append("doctor LIKE ?")
+        params.append(f"%{filters['doctor']}%")
+    if filters.get("patient"):
+        conditions.append("patient LIKE ?")
+        params.append(f"%{filters['patient']}%")
+    if filters.get("date_from"):
+        conditions.append("project_date >= ?")
+        params.append(filters["date_from"])
+    if filters.get("date_to"):
+        conditions.append("project_date <= ?")
+        params.append(filters["date_to"])
+
+    if not conditions:
+        return [], [], []
+
+    where = " AND ".join(conditions)
+    rows = [row_to_dict(r) for r in conn.execute(
+        f"SELECT * FROM projects WHERE {where} ORDER BY project_date DESC",
+        params
+    )]
+
+    # Group by which field(s) matched
+    clinics, doctors, patients = [], [], []
+    for r in rows:
+        placed = False
+        if filters.get("clinic") and r["clinic"] and filters["clinic"].lower() in (r["clinic"] or "").lower():
+            clinics.append(r)
+            placed = True
+        if filters.get("doctor") and r["doctor"] and filters["doctor"].lower() in (r["doctor"] or "").lower():
+            doctors.append(r)
+            placed = True
+        if filters.get("patient") and r["patient"] and filters["patient"].lower() in (r["patient"] or "").lower():
+            patients.append(r)
+            placed = True
+        # Date-only search — bucket everything under clinics
+        if not placed:
+            clinics.append(r)
+
+    return clinics, doctors, patients
+
+
+def keyword_search(conn, q: str) -> tuple[list, list, list]:
+    """Original LIKE search across clinic, doctor, patient."""
+    like = f"%{q}%"
+    clinics = [row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM projects WHERE clinic LIKE ? ORDER BY clinic, project_date DESC", (like,)
+    )]
+    doctors = [row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM projects WHERE doctor LIKE ? ORDER BY doctor, project_date DESC", (like,)
+    )]
+    patients = [row_to_dict(r) for r in conn.execute(
+        "SELECT * FROM projects WHERE patient LIKE ? ORDER BY patient, project_date DESC", (like,)
+    )]
+    return clinics, doctors, patients
+
+
+def build_interpretation_label(filters: dict) -> str:
+    """Human-readable summary of what the AI interpreted."""
+    parts = []
+    if filters.get("clinic"):
+        parts.append(f"Clinic: {filters['clinic']}")
+    if filters.get("doctor"):
+        parts.append(f"Dr. {filters['doctor']}")
+    if filters.get("patient"):
+        parts.append(f"Patient: {filters['patient']}")
+    if filters.get("date_from") and filters.get("date_to"):
+        parts.append(f"{filters['date_from']} → {filters['date_to']}")
+    elif filters.get("date_from"):
+        parts.append(f"From {filters['date_from']}")
+    elif filters.get("date_to"):
+        parts.append(f"Until {filters['date_to']}")
+    return "  ·  ".join(parts)
 
 
 # ─────────────────────────────────────────────
@@ -46,43 +215,54 @@ def row_to_dict(row):
 def search():
     q = request.args.get("q", "").strip()
     if not q or len(q) < 2:
-        return jsonify({"clinics": [], "doctors": [], "patients": []})
+        return jsonify({"clinics": [], "doctors": [], "patients": [], "mode": "none", "interpretation": ""})
 
-    like = f"%{q}%"
     conn = get_db()
+    filters = parse_search_query(q)
 
-    clinics = [row_to_dict(r) for r in conn.execute(
-        "SELECT * FROM projects WHERE clinic LIKE ? ORDER BY clinic, project_date DESC", (like,)
-    )]
-    doctors = [row_to_dict(r) for r in conn.execute(
-        "SELECT * FROM projects WHERE doctor LIKE ? ORDER BY doctor, project_date DESC", (like,)
-    )]
-    patients = [row_to_dict(r) for r in conn.execute(
-        "SELECT * FROM projects WHERE patient LIKE ? ORDER BY patient, project_date DESC", (like,)
-    )]
+    if filters:
+        clinics, doctors, patients = ai_search(conn, filters)
+        mode = "ai"
+        interpretation = build_interpretation_label(filters)
+
+        # Fallback to keyword if AI search returned nothing
+        if not clinics and not doctors and not patients:
+            clinics, doctors, patients = keyword_search(conn, q)
+            mode = "keyword"
+            interpretation = ""
+    else:
+        clinics, doctors, patients = keyword_search(conn, q)
+        mode = "keyword"
+        interpretation = ""
 
     conn.close()
-    return jsonify({"clinics": clinics, "doctors": doctors, "patients": patients})
+    return jsonify({
+        "clinics":        clinics,
+        "doctors":        doctors,
+        "patients":       patients,
+        "mode":           mode,
+        "interpretation": interpretation,
+    })
 
 
 @app.route("/api/stats")
 def stats():
     conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
-    clinics = conn.execute("SELECT COUNT(DISTINCT clinic) FROM projects WHERE clinic IS NOT NULL").fetchone()[0]
+    total      = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    clinics    = conn.execute("SELECT COUNT(DISTINCT clinic) FROM projects WHERE clinic IS NOT NULL").fetchone()[0]
     duplicates = conn.execute("SELECT COUNT(*) FROM projects WHERE is_duplicate = 1").fetchone()[0]
-    latest = conn.execute("SELECT project_date FROM projects ORDER BY project_date DESC LIMIT 1").fetchone()
+    latest     = conn.execute("SELECT project_date FROM projects ORDER BY project_date DESC LIMIT 1").fetchone()
     conn.close()
     return jsonify({
-        "total": total,
-        "clinics": clinics,
+        "total":      total,
+        "clinics":    clinics,
         "duplicates": duplicates,
-        "latest": latest[0] if latest else None,
+        "latest":     latest[0] if latest else None,
     })
 
 
 # ─────────────────────────────────────────────
-#  API — WATCH PATHS (settings)
+#  API — WATCH PATHS
 # ─────────────────────────────────────────────
 
 @app.route("/api/paths", methods=["GET"])
@@ -98,28 +278,25 @@ def get_paths():
     """).fetchall()
     conn.close()
     return jsonify([{
-        "id": r["id"],
-        "path": r["path"],
-        "label": r["label"],
-        "enabled": bool(r["enabled"]),
-        "added_at": r["added_at"],
-        "last_scanned": r["last_scanned"],
+        "id":            r["id"],
+        "path":          r["path"],
+        "label":         r["label"],
+        "enabled":       bool(r["enabled"]),
+        "added_at":      r["added_at"],
+        "last_scanned":  r["last_scanned"],
         "project_count": r["project_count"],
     } for r in rows])
 
 
 @app.route("/api/paths", methods=["POST"])
 def add_path():
-    data = request.json
-    path = (data.get("path") or "").strip()
+    data  = request.json
+    path  = (data.get("path") or "").strip()
     label = (data.get("label") or "").strip() or Path(path).name
-
     if not path:
         return jsonify({"error": "Path is required"}), 400
-
     if not Path(path).exists():
         return jsonify({"error": f"Path not accessible: {path}"}), 400
-
     conn = get_db()
     try:
         conn.execute(
@@ -138,18 +315,12 @@ def add_path():
 def update_path(path_id):
     data = request.json
     conn = get_db()
-
     if "enabled" in data:
-        conn.execute(
-            "UPDATE watch_paths SET enabled = ? WHERE id = ?",
-            (1 if data["enabled"] else 0, path_id)
-        )
+        conn.execute("UPDATE watch_paths SET enabled = ? WHERE id = ?",
+                     (1 if data["enabled"] else 0, path_id))
     if "label" in data:
-        conn.execute(
-            "UPDATE watch_paths SET label = ? WHERE id = ?",
-            (data["label"].strip(), path_id)
-        )
-
+        conn.execute("UPDATE watch_paths SET label = ? WHERE id = ?",
+                     (data["label"].strip(), path_id))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -162,8 +333,6 @@ def delete_path(path_id):
     if not row:
         conn.close()
         return jsonify({"error": "Not found"}), 404
-
-    # Remove associated projects
     conn.execute("DELETE FROM projects WHERE folder_path LIKE ?", (row["path"] + "%",))
     conn.execute("DELETE FROM watch_paths WHERE id = ?", (path_id,))
     conn.commit()
@@ -186,7 +355,7 @@ def settings():
 
 
 # ─────────────────────────────────────────────
-#  SHARED STYLES
+#  SHARED CSS
 # ─────────────────────────────────────────────
 
 SHARED_CSS = """
@@ -206,6 +375,7 @@ SHARED_CSS = """
     --patient:   #c792ea;
     --danger:    #ff6b6b;
     --warning:   #ffd166;
+    --ai-color:  #7eb8ff;
     --radius:    10px;
   }
 
@@ -220,82 +390,42 @@ SHARED_CSS = """
   header {
     padding: 28px 40px;
     border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 16px;
+    display: flex; align-items: center; gap: 16px;
     background: var(--surface);
     position: sticky; top: 0; z-index: 100;
   }
 
   .logo { flex-shrink: 0; text-decoration: none; }
 
-  .brand a {
-    text-decoration: none; color: inherit;
-  }
-
+  .brand a  { text-decoration: none; color: inherit; }
   .brand h1 { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; line-height: 1; }
   .brand p  { font-size: 11px; color: var(--muted); font-family: 'DM Mono', monospace; margin-top: 2px; }
 
-  .header-right {
-    margin-left: auto;
-    display: flex; align-items: center; gap: 16px;
-  }
+  .header-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
 
-  .stats {
-    display: flex; gap: 20px;
-    font-family: 'DM Mono', monospace;
-    font-size: 11px; color: var(--muted); text-align: right;
-  }
-
+  .stats { display: flex; gap: 20px; font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); text-align: right; }
   .stats span { color: var(--accent); font-weight: 500; }
-
   .stats .dup-count span { color: var(--warning); }
 
   .settings-btn {
-    width: 36px; height: 36px;
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    width: 36px; height: 36px; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 8px;
     display: flex; align-items: center; justify-content: center;
-    color: var(--muted); font-size: 18px;
-    cursor: pointer; text-decoration: none;
-    transition: all 0.15s;
+    color: var(--muted); font-size: 18px; cursor: pointer;
+    text-decoration: none; transition: all 0.15s;
   }
-
   .settings-btn:hover { border-color: var(--accent); color: var(--accent); }
   .settings-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(245,166,35,0.08); }
 
-  /* Buttons */
-  .btn {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 8px 16px; border-radius: 8px;
-    font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 600;
-    cursor: pointer; transition: all 0.15s; border: none;
-  }
-
-  .btn-primary {
-    background: var(--accent); color: #0e1117;
-  }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 8px; font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s; border: none; }
+  .btn-primary { background: var(--accent); color: #0e1117; }
   .btn-primary:hover { background: var(--accent2); }
-
-  .btn-ghost {
-    background: transparent; color: var(--muted);
-    border: 1px solid var(--border);
-  }
+  .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
   .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
-
-  .btn-danger {
-    background: transparent; color: var(--danger);
-    border: 1px solid rgba(255,107,107,0.3);
-  }
+  .btn-danger { background: transparent; color: var(--danger); border: 1px solid rgba(255,107,107,0.3); }
   .btn-danger:hover { background: rgba(255,107,107,0.1); }
 
-  .tag {
-    font-size: 10px; font-family: 'DM Mono', monospace; font-weight: 500;
-    padding: 3px 10px; border-radius: 20px;
-    letter-spacing: 0.08em; text-transform: uppercase;
-  }
-
+  .tag { font-size: 10px; font-family: 'DM Mono', monospace; font-weight: 500; padding: 3px 10px; border-radius: 20px; letter-spacing: 0.08em; text-transform: uppercase; }
   .tag-clinic  { background: rgba(74,158,255,0.15);  color: var(--clinic); }
   .tag-doctor  { background: rgba(126,212,160,0.15); color: var(--doctor); }
   .tag-patient { background: rgba(199,146,234,0.15); color: var(--patient); }
@@ -303,7 +433,7 @@ SHARED_CSS = """
 """
 
 # ─────────────────────────────────────────────
-#  SEARCH PAGE
+#  SEARCH PAGE HTML
 # ─────────────────────────────────────────────
 
 SEARCH_HTML = """<!DOCTYPE html>
@@ -320,92 +450,73 @@ SEARCH_HTML = """<!DOCTYPE html>
   .search-wrap { padding: 32px 40px 0; max-width: 900px; }
 
   .search-box { position: relative; }
-
   .search-box input {
     width: 100%; padding: 16px 20px 16px 52px;
     font-size: 17px; font-family: 'Syne', sans-serif; font-weight: 600;
     background: var(--surface); border: 2px solid var(--border);
-    border-radius: var(--radius); color: var(--text); outline: none;
-    transition: border-color 0.2s;
+    border-radius: var(--radius); color: var(--text); outline: none; transition: border-color 0.2s;
   }
-
   .search-box input:focus { border-color: var(--accent); }
   .search-box input::placeholder { color: var(--muted); font-weight: 400; }
+  .search-icon { position: absolute; left: 18px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 18px; pointer-events: none; }
 
-  .search-icon {
-    position: absolute; left: 18px; top: 50%; transform: translateY(-50%);
-    color: var(--muted); font-size: 18px; pointer-events: none;
-  }
+  .hint { margin-top: 10px; font-size: 12px; font-family: 'DM Mono', monospace; color: var(--muted); padding-left: 4px; }
 
-  .hint {
-    margin-top: 10px; font-size: 12px;
-    font-family: 'DM Mono', monospace; color: var(--muted); padding-left: 4px;
+  /* AI interpretation bar */
+  .interpretation-bar {
+    margin-top: 10px; padding: 8px 14px;
+    background: rgba(126,184,255,0.07);
+    border: 1px solid rgba(126,184,255,0.2);
+    border-radius: 8px;
+    font-family: 'DM Mono', monospace; font-size: 12px; color: var(--ai-color);
+    display: none; align-items: center; gap: 8px;
   }
+  .interpretation-bar.visible { display: flex; }
+  .ai-badge {
+    font-size: 10px; background: rgba(126,184,255,0.15); color: var(--ai-color);
+    border-radius: 4px; padding: 2px 7px; letter-spacing: 0.06em; flex-shrink: 0;
+  }
+  .fallback-bar {
+    margin-top: 10px; padding: 6px 14px;
+    background: rgba(255,209,102,0.06); border: 1px solid rgba(255,209,102,0.2);
+    border-radius: 8px; font-family: 'DM Mono', monospace; font-size: 12px;
+    color: var(--warning); display: none; align-items: center; gap: 8px;
+  }
+  .fallback-bar.visible { display: flex; }
 
   .results { padding: 28px 40px 0; max-width: 1200px; display: flex; flex-direction: column; gap: 32px; }
 
-  .empty-state {
-    padding: 60px 40px; text-align: center;
-    color: var(--muted); font-family: 'DM Mono', monospace; font-size: 13px;
-  }
+  .empty-state { padding: 60px 40px; text-align: center; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 13px; }
 
   .group-label { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
   .group-count { font-size: 12px; font-family: 'DM Mono', monospace; color: var(--muted); }
 
   .table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-
-  thead th {
-    background: var(--surface); padding: 10px 16px; text-align: left;
-    font-size: 10px; font-family: 'DM Mono', monospace;
-    text-transform: uppercase; letter-spacing: 0.08em;
-    color: var(--muted); border-bottom: 1px solid var(--border); font-weight: 500;
-  }
-
+  thead th { background: var(--surface); padding: 10px 16px; text-align: left; font-size: 10px; font-family: 'DM Mono', monospace; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); border-bottom: 1px solid var(--border); font-weight: 500; }
   tbody tr { border-bottom: 1px solid var(--border); transition: background 0.15s; }
   tbody tr:last-child { border-bottom: none; }
   tbody tr:hover { background: rgba(255,255,255,0.03); }
   tbody tr.is-duplicate { background: rgba(255,209,102,0.04); }
-
   td { padding: 11px 16px; vertical-align: middle; }
 
-  .date-cell   { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--muted); white-space: nowrap; }
-  .clinic-cell { color: var(--clinic); font-weight: 600; }
-  .doctor-cell { color: var(--doctor); }
-  .patient-cell{ color: var(--patient); font-weight: 600; }
+  .date-cell    { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .clinic-cell  { color: var(--clinic); font-weight: 600; }
+  .doctor-cell  { color: var(--doctor); }
+  .patient-cell { color: var(--patient); font-weight: 600; }
+  .path-cell    { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .path-cell {
-    font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted);
-    max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-
-  .copy-btn {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 4px 10px; font-size: 11px; font-family: 'DM Mono', monospace;
-    background: transparent; border: 1px solid var(--border);
-    border-radius: 6px; color: var(--muted); cursor: pointer; transition: all 0.15s;
-    white-space: nowrap;
-  }
-
+  .copy-btn { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; font-size: 11px; font-family: 'DM Mono', monospace; background: transparent; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); cursor: pointer; transition: all 0.15s; white-space: nowrap; }
   .copy-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(245,166,35,0.08); }
   .copy-btn.copied { border-color: var(--doctor); color: var(--doctor); background: rgba(126,212,160,0.08); }
 
-  .dup-badge {
-    display: inline-flex; align-items: center; gap: 4px;
-    font-size: 10px; font-family: 'DM Mono', monospace;
-    color: var(--warning); background: rgba(255,209,102,0.12);
-    border: 1px solid rgba(255,209,102,0.25);
-    border-radius: 4px; padding: 2px 7px;
-    white-space: nowrap;
-  }
+  .dup-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-family: 'DM Mono', monospace; color: var(--warning); background: rgba(255,209,102,0.12); border: 1px solid rgba(255,209,102,0.25); border-radius: 4px; padding: 2px 7px; white-space: nowrap; }
 
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
   .loading { padding: 40px; text-align: center; font-family: 'DM Mono', monospace; font-size: 12px; color: var(--muted); animation: pulse 1.2s ease-in-out infinite; }
 </style>
 </head>
 <body>
-
 <header>
   <a href="/" class="logo"><img src="/static/yclab-icon-192.png" style="width:40px;height:40px;border-radius:9px;display:block;"></a>
   <div class="brand">
@@ -426,9 +537,16 @@ SEARCH_HTML = """<!DOCTYPE html>
 <div class="search-wrap">
   <div class="search-box">
     <span class="search-icon">⌕</span>
-    <input type="text" id="search" placeholder="Search by clinic, doctor, or patient name..." autocomplete="off" autofocus>
+    <input type="text" id="search" placeholder="e.g. trusmiles 2024 may  |  barkwell last 3 months  |  john smith sherwood" autocomplete="off" autofocus>
   </div>
-  <p class="hint">Type at least 2 characters — results grouped by clinic, doctor, and patient matches</p>
+  <div class="interpretation-bar" id="interp-bar">
+    <span class="ai-badge">AI</span>
+    <span id="interp-text"></span>
+  </div>
+  <div class="fallback-bar" id="fallback-bar">
+    <span>⚠ AI search returned no results — showing keyword matches instead</span>
+  </div>
+  <p class="hint" id="hint-text">Describe what you're looking for — clinic, doctor, patient, date or date range</p>
 </div>
 
 <div class="results" id="results">
@@ -436,8 +554,11 @@ SEARCH_HTML = """<!DOCTYPE html>
 </div>
 
 <script>
-const searchEl = document.getElementById('search');
-const resultsEl = document.getElementById('results');
+const searchEl   = document.getElementById('search');
+const resultsEl  = document.getElementById('results');
+const interpBar  = document.getElementById('interp-bar');
+const interpText = document.getElementById('interp-text');
+const fallbackBar = document.getElementById('fallback-bar');
 let debounceTimer;
 
 fetch('/api/stats').then(r => r.json()).then(d => {
@@ -452,22 +573,39 @@ fetch('/api/stats').then(r => r.json()).then(d => {
 searchEl.addEventListener('input', () => {
   clearTimeout(debounceTimer);
   const q = searchEl.value.trim();
+  interpBar.classList.remove('visible');
+  fallbackBar.classList.remove('visible');
   if (q.length < 2) {
     resultsEl.innerHTML = '<div class="empty-state">Start typing to search cases</div>';
     return;
   }
-  resultsEl.innerHTML = '<div class="loading">Searching...</div>';
-  debounceTimer = setTimeout(() => doSearch(q), 250);
+  resultsEl.innerHTML = '<div class="loading">Thinking...</div>';
+  debounceTimer = setTimeout(() => doSearch(q), 500);
 });
 
 async function doSearch(q) {
   const res  = await fetch('/api/search?q=' + encodeURIComponent(q));
   const data = await res.json();
+
+  // Show interpretation bar
+  interpBar.classList.remove('visible');
+  fallbackBar.classList.remove('visible');
+
+  if (data.mode === 'ai' && data.interpretation) {
+    interpText.textContent = data.interpretation;
+    interpBar.classList.add('visible');
+  } else if (data.mode === 'keyword' && data.interpretation === '') {
+    // Was AI but fell back
+    const total = data.clinics.length + data.doctors.length + data.patients.length;
+    if (total > 0) fallbackBar.classList.add('visible');
+  }
+
   const total = data.clinics.length + data.doctors.length + data.patients.length;
   if (total === 0) {
     resultsEl.innerHTML = '<div class="empty-state">No results found for &ldquo;' + escHtml(q) + '&rdquo;</div>';
     return;
   }
+
   let html = '';
   if (data.clinics.length)  html += renderGroup('clinic',  'Clinic',  data.clinics);
   if (data.doctors.length)  html += renderGroup('doctor',  'Doctor',  data.doctors);
@@ -484,9 +622,7 @@ function renderGroup(type, label, rows) {
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr>
-            <th>Date</th><th>Clinic</th><th>Doctor</th><th>Patient</th><th>Folder Path</th><th></th><th></th>
-          </tr></thead>
+          <thead><tr><th>Date</th><th>Clinic</th><th>Doctor</th><th>Patient</th><th>Folder Path</th><th></th><th></th></tr></thead>
           <tbody>${rows.map(renderRow).join('')}</tbody>
         </table>
       </div>
@@ -496,9 +632,7 @@ function renderGroup(type, label, rows) {
 function renderRow(r) {
   const path  = r.folder_path || '';
   const btnId = 'btn-' + r.id;
-  const dupBadge = r.is_duplicate
-    ? '<span class="dup-badge">⚠ duplicate</span>'
-    : '';
+  const dupBadge = r.is_duplicate ? '<span class="dup-badge">⚠ duplicate</span>' : '';
   return `
     <tr class="${r.is_duplicate ? 'is-duplicate' : ''}">
       <td class="date-cell">${r.project_date || '—'}</td>
@@ -507,11 +641,7 @@ function renderRow(r) {
       <td class="patient-cell">${escHtml(r.patient || '—')}</td>
       <td class="path-cell" title="${escHtml(path)}">${escHtml(path)}</td>
       <td>${dupBadge}</td>
-      <td>
-        <button class="copy-btn" id="${btnId}" data-path="${escHtml(path)}" onclick="copyPath(this)">
-          ⎘ Copy path
-        </button>
-      </td>
+      <td><button class="copy-btn" id="${btnId}" data-path="${escHtml(path)}" onclick="copyPath(this)">⎘ Copy path</button></td>
     </tr>`;
 }
 
@@ -533,7 +663,7 @@ function escHtml(str) {
 
 
 # ─────────────────────────────────────────────
-#  SETTINGS PAGE
+#  SETTINGS PAGE HTML
 # ─────────────────────────────────────────────
 
 SETTINGS_HTML = """<!DOCTYPE html>
@@ -548,97 +678,46 @@ SETTINGS_HTML = """<!DOCTYPE html>
 """ + SHARED_CSS + """
 
   .page { padding: 36px 40px; max-width: 860px; }
-
-  .page-title {
-    font-size: 24px; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 6px;
-  }
-
+  .page-title    { font-size: 24px; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 6px; }
   .page-subtitle { font-size: 13px; color: var(--muted); font-family: 'DM Mono', monospace; margin-bottom: 32px; }
 
-  /* Add form */
-  .add-form {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 20px 24px; margin-bottom: 32px;
-  }
-
-  .add-form h2 { font-size: 14px; font-weight: 700; margin-bottom: 16px; color: var(--text); }
-
+  .add-form { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 24px; margin-bottom: 32px; }
+  .add-form h2 { font-size: 14px; font-weight: 700; margin-bottom: 16px; }
   .form-row { display: flex; gap: 12px; align-items: flex-start; }
-
   .form-group { display: flex; flex-direction: column; gap: 6px; flex: 1; }
-
   .form-group label { font-size: 11px; font-family: 'DM Mono', monospace; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
-
-  .form-group input {
-    padding: 10px 14px; background: var(--bg); border: 1px solid var(--border);
-    border-radius: 8px; color: var(--text); font-family: 'DM Mono', monospace;
-    font-size: 13px; outline: none; transition: border-color 0.2s;
-  }
-
+  .form-group input { padding: 10px 14px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: 'DM Mono', monospace; font-size: 13px; outline: none; transition: border-color 0.2s; }
   .form-group input:focus { border-color: var(--accent); }
   .form-group input::placeholder { color: var(--muted); }
-
-  .form-error { font-size: 12px; font-family: 'DM Mono', monospace; color: var(--danger); margin-top: 10px; display: none; }
+  .form-error   { font-size: 12px; font-family: 'DM Mono', monospace; color: var(--danger); margin-top: 10px; display: none; }
   .form-success { font-size: 12px; font-family: 'DM Mono', monospace; color: var(--doctor); margin-top: 10px; display: none; }
 
-  /* Path list */
   .section-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 14px; font-family: 'DM Mono', monospace; }
 
-  .path-card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: var(--radius); padding: 16px 20px;
-    margin-bottom: 10px; display: flex; align-items: center; gap: 16px;
-    transition: border-color 0.15s;
-  }
-
+  .path-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 20px; margin-bottom: 10px; display: flex; align-items: center; gap: 16px; transition: border-color 0.15s; }
   .path-card:hover { border-color: rgba(255,255,255,0.1); }
   .path-card.disabled { opacity: 0.5; }
-
   .path-info { flex: 1; min-width: 0; }
-
-  .path-label {
-    font-size: 14px; font-weight: 700; margin-bottom: 4px;
-    display: flex; align-items: center; gap: 8px;
-  }
-
-  .path-str {
-    font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted);
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-
-  .path-meta {
-    font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted);
-    margin-top: 6px; display: flex; gap: 16px;
-  }
-
+  .path-label { font-size: 14px; font-weight: 700; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+  .path-str   { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .path-meta  { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); margin-top: 6px; display: flex; gap: 16px; }
   .path-meta span { color: var(--text); }
-
   .path-actions { display: flex; gap: 8px; flex-shrink: 0; }
 
-  .toggle-btn {
-    width: 40px; height: 22px; border-radius: 11px; border: none; cursor: pointer;
-    position: relative; transition: background 0.2s; flex-shrink: 0;
-  }
-
-  .toggle-btn::after {
-    content: ''; position: absolute; width: 16px; height: 16px;
-    background: white; border-radius: 50%; top: 3px; transition: left 0.2s;
-  }
-
+  .toggle-btn { width: 40px; height: 22px; border-radius: 11px; border: none; cursor: pointer; position: relative; transition: background 0.2s; flex-shrink: 0; }
+  .toggle-btn::after { content: ''; position: absolute; width: 16px; height: 16px; background: white; border-radius: 50%; top: 3px; transition: left 0.2s; }
   .toggle-btn.on  { background: var(--accent); }
   .toggle-btn.on::after  { left: 21px; }
   .toggle-btn.off { background: var(--border); }
   .toggle-btn.off::after { left: 3px; }
 
   .empty-paths { padding: 40px; text-align: center; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 13px; }
-
   .badge-count { background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 1px 8px; font-size: 11px; font-family: 'DM Mono', monospace; color: var(--muted); }
 </style>
 </head>
 <body>
-
 <header>
-  <a href="/" class="logo">CF</a>
+  <a href="/" class="logo"><img src="/static/yclab-icon-192.png" style="width:40px;height:40px;border-radius:9px;display:block;"></a>
   <div class="brand">
     <a href="/"><h1>CaseFinder</h1></a>
     <p>Exocad Project Lookup — YC Lab</p>
@@ -652,7 +731,6 @@ SETTINGS_HTML = """<!DOCTYPE html>
   <div class="page-title">Watch Folders</div>
   <div class="page-subtitle">Folders added here are scanned automatically. The scanner picks up new entries within 30 seconds.</div>
 
-  <!-- Add form -->
   <div class="add-form">
     <h2>Add a folder to watch</h2>
     <div class="form-row">
@@ -668,11 +746,10 @@ SETTINGS_HTML = """<!DOCTYPE html>
         <button class="btn btn-primary" onclick="addPath()">+ Add</button>
       </div>
     </div>
-    <div class="form-error" id="form-error"></div>
+    <div class="form-error"   id="form-error"></div>
     <div class="form-success" id="form-success"></div>
   </div>
 
-  <!-- Path list -->
   <div class="section-title">Watched Folders</div>
   <div id="path-list"><div class="empty-paths">Loading...</div></div>
 </div>
@@ -682,12 +759,7 @@ async function loadPaths() {
   const res  = await fetch('/api/paths');
   const rows = await res.json();
   const el   = document.getElementById('path-list');
-
-  if (rows.length === 0) {
-    el.innerHTML = '<div class="empty-paths">No folders added yet.</div>';
-    return;
-  }
-
+  if (rows.length === 0) { el.innerHTML = '<div class="empty-paths">No folders added yet.</div>'; return; }
   el.innerHTML = rows.map(r => `
     <div class="path-card ${r.enabled ? '' : 'disabled'}" id="card-${r.id}">
       <div class="path-info">
@@ -706,8 +778,7 @@ async function loadPaths() {
         <button class="toggle-btn ${r.enabled ? 'on' : 'off'}" title="${r.enabled ? 'Disable' : 'Enable'}" onclick="togglePath(${r.id}, ${r.enabled})"></button>
         <button class="btn btn-danger" onclick="deletePath(${r.id}, '${escHtml(r.label || r.path)}')">Remove</button>
       </div>
-    </div>
-  `).join('');
+    </div>`).join('');
 }
 
 async function addPath() {
@@ -715,18 +786,10 @@ async function addPath() {
   const label = document.getElementById('input-label').value.trim();
   const errEl = document.getElementById('form-error');
   const okEl  = document.getElementById('form-success');
-  errEl.style.display = 'none';
-  okEl.style.display  = 'none';
-
+  errEl.style.display = 'none'; okEl.style.display = 'none';
   if (!path) { showError('Please enter a folder path.'); return; }
-
-  const res  = await fetch('/api/paths', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({path, label}),
-  });
+  const res  = await fetch('/api/paths', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({path, label}) });
   const data = await res.json();
-
   if (!res.ok) {
     showError(data.error || 'Failed to add path.');
   } else {
@@ -740,11 +803,7 @@ async function addPath() {
 }
 
 async function togglePath(id, currentlyEnabled) {
-  await fetch('/api/paths/' + id, {
-    method: 'PATCH',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({enabled: !currentlyEnabled}),
-  });
+  await fetch('/api/paths/' + id, { method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({enabled: !currentlyEnabled}) });
   loadPaths();
 }
 
@@ -754,19 +813,13 @@ async function deletePath(id, label) {
   loadPaths();
 }
 
-function showError(msg) {
-  const el = document.getElementById('form-error');
-  el.textContent = msg;
-  el.style.display = 'block';
-}
+function showError(msg) { const el = document.getElementById('form-error'); el.textContent = msg; el.style.display = 'block'; }
 
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 loadPaths();
-
-// Auto-refresh path list every 30s to reflect scanner updates
 setInterval(loadPaths, 30000);
 </script>
 </body>
